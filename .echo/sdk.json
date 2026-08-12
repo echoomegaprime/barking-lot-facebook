@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "name": "barking-lot-facebook",
+  "capabilities": [],
+  "note": "Plain Cloudflare Worker for a third-party nonprofit client (The Barking Lot Animal Sanctuary). Driven by its own HTTP routes + cron trigger and Facebook Graph/Messenger APIs, not registered via the Echo SDK gate.",
+  "entrypoints": ["scripts/certforge_journey.py"],
+  "data_classification": "restricted",
+  "network": "internal"
+}

@@ -5,7 +5,7 @@
  * - CORS-enabled for barkinglot.org
  */
 
-interface Env {
+export interface Env {
   CACHE: KVNamespace;
   AI: Ai;
   FB_PAGE_ID: string;
@@ -350,8 +350,54 @@ async function sendMessengerText(recipientId: string, text: string, env: Env) {
   }
 }
 
-async function handleMessengerWebhook(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { object: string; entry: MessengerEntry[] };
+// ─── Webhook signature verification ─────────────────────────────
+// Facebook signs every webhook POST with X-Hub-Signature-256: an HMAC-SHA256
+// of the raw request body, keyed with the app secret. Without verifying this,
+// anyone who knows the URL can POST a forged event and trigger a paid Workers
+// AI call plus a real Messenger send from the page's own token to any
+// recipient ID -- this Worker previously had no verification at all despite
+// declaring FB_APP_SECRET in its Env for exactly this purpose.
+export function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+async function hmacSha256Hex(secret: string, payload: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export async function verifyFacebookSignature(request: Request, rawBody: string, env: Env): Promise<boolean> {
+  if (!env.FB_APP_SECRET) return false;
+  const header = request.headers.get("X-Hub-Signature-256") || "";
+  const [algo, providedSig] = header.split("=");
+  if (algo !== "sha256" || !providedSig) return false;
+  const expectedSig = await hmacSha256Hex(env.FB_APP_SECRET, rawBody);
+  return timingSafeEqualHex(providedSig, expectedSig);
+}
+
+export async function handleMessengerWebhook(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+
+  if (!(await verifyFacebookSignature(request, rawBody, env))) {
+    console.error("Messenger webhook: invalid or missing X-Hub-Signature-256");
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  const body = JSON.parse(rawBody) as { object: string; entry: MessengerEntry[] };
 
   if (body.object !== "page") {
     return new Response("Not a page event", { status: 404 });
@@ -385,13 +431,26 @@ async function handleMessengerWebhook(request: Request, env: Env): Promise<Respo
   return new Response("EVENT_RECEIVED", { status: 200 });
 }
 
-function verifyMessengerWebhook(request: Request, env: Env): Response {
+export function timingSafeEqual(a: string, b: string): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+export function verifyMessengerWebhook(request: Request, env: Env): Response {
   const url = new URL(request.url);
   const mode = url.searchParams.get("hub.mode");
   const token = url.searchParams.get("hub.verify_token");
   const challenge = url.searchParams.get("hub.challenge");
 
-  if (mode === "subscribe" && token === env.FB_VERIFY_TOKEN) {
+  if (!env.FB_VERIFY_TOKEN) {
+    return new Response("Service misconfigured", { status: 503 });
+  }
+
+  if (mode === "subscribe" && token && timingSafeEqual(token, env.FB_VERIFY_TOKEN)) {
     return new Response(challenge, { status: 200 });
   }
   return new Response("Forbidden", { status: 403 });
@@ -450,7 +509,28 @@ function getWidgetScript(env: Env): string {
 }
 
 // ─── Image proxy (avoids FB CDN token expiration) ───────────────
+// Restricted to Facebook's own CDN hosts. Without this allowlist, /api/image-proxy
+// is an open server-side fetch of any URL an attacker supplies (SSRF) -- the
+// Worker would happily fetch and return the body of anything reachable from
+// Cloudflare's edge, laundered through this sanctuary's domain and cache.
+const ALLOWED_IMAGE_HOSTS = [/(^|\.)fbcdn\.net$/i, /(^|\.)facebook\.com$/i, /(^|\.)cdninstagram\.com$/i];
+
+export function isAllowedImageHost(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  return ALLOWED_IMAGE_HOSTS.some((re) => re.test(parsed.hostname));
+}
+
 async function proxyImage(request: Request, env: Env, imageUrl: string): Promise<Response> {
+  if (!isAllowedImageHost(imageUrl)) {
+    return new Response("Image host not allowed", { status: 400, headers: corsHeaders(request, env) });
+  }
+
   // Check KV cache first
   const cacheKey = `img_${btoa(imageUrl).substring(0, 100)}`;
   const cached = await env.CACHE.get(cacheKey, "arrayBuffer");
